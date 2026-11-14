@@ -14,13 +14,35 @@ app.disable("x-powered-by");
 
 app.use(helmet());
 
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:5174",
+  ...(process.env.CLIENT_URL || "")
+    .split(",")
+    .map((url) => url.trim())
+    .filter(Boolean),
+];
+
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin: (origin, callback) => {
+      // Allow requests without an Origin header (e.g. server-to-server).
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(null, false);
+    },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Idempotency-Key",
+    ],
   })
 );
+
 
 app.use(express.json({ limit: "20kb" }));
 
