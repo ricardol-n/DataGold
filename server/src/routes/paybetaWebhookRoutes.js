@@ -3,7 +3,16 @@ const express = require("express");
 const crypto = require("crypto");
 const Transaction = require("../models/transaction");
 
+const {
+  refundConfirmedFailure,
+} = require("../services/paybetaRefundService");
+
 const router = express.Router();
+
+const PAYBETA_BASE_URLS = {
+  sandbox: "https://api.sandbox.paybeta.ng",
+  production: "https://api.paybeta.ng",
+};
 
 function verifyPaybetaSignature(reference, signature, secret) {
   if (
@@ -36,6 +45,7 @@ function verifyPaybetaSignature(reference, signature, secret) {
 
 router.post("/", async (req, res) => {
   try {
+    const apiKey = process.env.PAYBETA_API_KEY;
     const secret = process.env.PAYBETA_SECRET_KEY;
 
     const reference = req.body?.data?.reference;
@@ -55,21 +65,18 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // Only reconcile DataGold data-purchase orders.
     const transaction = await Transaction.findOne({
       reference,
       type: "data_purchase",
     });
 
     if (!transaction) {
-      // Do not acknowledge an unknown reference as processed.
       return res.status(404).json({
         success: false,
         message: "DataGold transaction not found.",
       });
     }
 
-    // Never change a final transaction back to pending.
     if (transaction.status !== "pending") {
       return res.status(200).json({
         success: true,
@@ -77,49 +84,78 @@ router.post("/", async (req, res) => {
       });
     }
 
-    const baseUrl = process.env.PAYBETA_BASE_URL;
-    const expectedUrl = "https://api.paybeta.ng";
+    const mode = process.env.PAYBETA_MODE;
+    const baseUrl = (process.env.PAYBETA_BASE_URL || "").replace(/\/+$/, "");
+    const expectedUrl = PAYBETA_BASE_URLS[mode];
 
-    if (baseUrl !== expectedUrl) {
+    if (!expectedUrl || baseUrl !== expectedUrl) {
       return res.status(503).json({
         success: false,
-        message: "Production Paybeta URL is not configured.",
+        message: "Paybeta mode or base URL is incorrectly configured.",
       });
     }
 
-    // Ask Paybeta for the transaction's current state.
+    if (!apiKey) {
+      return res.status(503).json({
+        success: false,
+        message: "Paybeta API key is not configured.",
+      });
+    }
+
+    // Always verify the actual transaction status with Paybeta.
     const response = await fetch(
-      `${expectedUrl}/v2/transaction/query`,
+      `${baseUrl}/v2/transaction/query`,
       {
         method: "POST",
         headers: {
           Accept: "application/json",
           "Content-Type": "application/json",
-          "P-API-KEY": secret,
+          "P-API-KEY": apiKey,
         },
         body: JSON.stringify({ reference }),
         signal: AbortSignal.timeout(10000),
       }
     );
 
-    const result = await response.json();
-
-    if (!response.ok || !result?.data) {
+    if (!response.ok) {
       return res.status(503).json({
         success: false,
         message: "Unable to verify transaction status with Paybeta.",
       });
     }
 
+    const result = await response.json();
+
+    // Only refund when Paybeta confirms a final failure.
+    if (String(result?.code) === "02") {
+      const refundResult = await refundConfirmedFailure(
+        transaction._id,
+        reference
+      );
+
+      if (!refundResult.refunded) {
+        return res.status(503).json({
+          success: false,
+          message: "Confirmed failure could not be reconciled yet.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Confirmed failed purchase refunded successfully.",
+      });
+    }
+
     const paymentStatus = String(
-      result.data.paymentStatus || ""
+      result?.data?.paymentStatus || ""
     ).toLowerCase();
 
-    // Only mark delivered when Paybeta confirms delivery.
-    if (
-      result.status === "successful" &&
-      paymentStatus === "delivered"
-    ) {
+    // Complete only after Paybeta confirms delivery.
+          if (
+        String(result?.code) === "00" &&
+        result?.status === "successful" &&
+        paymentStatus === "delivered"
+      ) {
       const updated = await Transaction.findOneAndUpdate(
         {
           _id: transaction._id,
@@ -146,9 +182,8 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // Unknown or unresolved states remain pending.
-    // Do not refund or retry until a confirmed final failure
-    // is handled by the dedicated reconciliation logic.
+    // Pending, not found, and unknown results are not failures.
+    // Never refund these automatically.
     return res.status(200).json({
       success: true,
       message: "Transaction received; status remains unresolved.",

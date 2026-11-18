@@ -4,6 +4,10 @@ require("dotenv").config();
 const app = require("./app");
 const connectDB = require("./config/db");
 
+const {
+  startPaybetaReconciliationWorker,
+} = require("./workers/paybetaReconciliationWorker");
+
 async function startServer() {
   const secret = process.env.JWT_ACCESS_SECRET;
 
@@ -14,6 +18,12 @@ async function startServer() {
   }
 
   await connectDB();
+
+  if (process.env.PAYBETA_RECONCILIATION_ENABLED === "true") {
+    startPaybetaReconciliationWorker();
+  } else {
+    console.log("Paybeta reconciliation worker is disabled.");
+  }
 
   const port = Number(process.env.PORT) || 4000;
 

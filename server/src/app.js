@@ -77,6 +77,8 @@ app.use((req, res) => {
 });
 
 // Central error handler.
+
+// Central error handler.
 app.use((error, req, res, next) => {
   console.error("API error:", error.message);
 
@@ -84,7 +86,20 @@ app.use((error, req, res, next) => {
     return next(error);
   }
 
+  // Handle malformed JSON request bodies.
+  if (
+    error instanceof SyntaxError &&
+    error.status === 400 &&
+    "body" in error
+  ) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid JSON request body.",
+    });
+  }
+
   res.status(500).json({
+    success: false,
     message: "An unexpected error occurred.",
   });
 });

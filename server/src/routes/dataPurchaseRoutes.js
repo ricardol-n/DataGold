@@ -8,6 +8,9 @@ const { protect } = require("../middleware/authMiddleware");
 
 const User = require("../models/user");
 const Transaction = require("../models/transaction");
+const {
+  refundConfirmedFailure,
+} = require("../services/paybetaRefundService");
 
 const NETWORKS = {
   mtn: "mtn_data",
@@ -32,7 +35,7 @@ function makeReference(userId, idempotencyKey) {
 }
 
 
-async function getPaybetaPlans(baseUrl, secret, service) {
+async function getPaybetaPlans(baseUrl, apiKey, service) {
   const url = new URL(`${baseUrl}/v2/data-bundle/list`);
   url.searchParams.set("service", service);
 
@@ -40,7 +43,7 @@ async function getPaybetaPlans(baseUrl, secret, service) {
     method: "GET",
     headers: {
       Accept: "application/json",
-      "P-API-KEY": secret,
+      "P-API-KEY": apiKey,
     },
     signal: AbortSignal.timeout(15000),
   });
@@ -76,63 +79,6 @@ async function getPaybetaPlans(baseUrl, secret, service) {
   return result.data.packages;
 }
 
-
-async function refundConfirmedFailure(transactionId, reference) {
-  const session = await mongoose.startSession();
-
-  try {
-    await session.withTransaction(async () => {
-      const transaction = await Transaction.findOne({
-        _id: transactionId,
-        status: "pending",
-      }).session(session);
-
-      // A completed/refunded transaction must never be refunded twice.
-      if (!transaction) return;
-
-      const refundReference = `${reference}-refund`;
-
-      const existingRefund = await Transaction.findOne({
-        reference: refundReference,
-      }).session(session);
-
-      if (existingRefund) return;
-
-      await User.updateOne(
-        { _id: transaction.user },
-        { $inc: { walletBalance: transaction.amount } },
-        { session }
-      );
-
-      await Transaction.create(
-        [
-          {
-            user: transaction.user,
-            type: "refund",
-            amount: transaction.amount,
-            status: "completed",
-            reference: refundReference,
-            description: "Refund for failed data purchase",
-            metadata: {
-              originalReference: reference,
-            },
-          },
-        ],
-        { session }
-      );
-
-      transaction.status = "failed";
-      transaction.metadata = {
-        ...(transaction.metadata || {}),
-        refunded: true,
-      };
-
-      await transaction.save({ session });
-    });
-  } finally {
-    await session.endSession();
-  }
-}
 
 
 router.get("/", protect, async (req, res) => {
@@ -261,7 +207,6 @@ router.post("/", protect, async (req, res) => {
     const planCode = String(req.body.planCode || "").trim();
     const phone = String(req.body.phone || "").trim();
 
-    // Require a stable key for retries of the same order.
     const idempotencyKey = String(
       req.get("Idempotency-Key") || ""
     ).trim();
@@ -296,7 +241,7 @@ router.post("/", protect, async (req, res) => {
 
     reference = makeReference(req.user._id, idempotencyKey);
 
-    // A retry of the same order must not submit another purchase.
+    // Prevent duplicate submissions.
     const existing = await Transaction.findOne({ reference });
 
     if (existing) {
@@ -311,8 +256,6 @@ router.post("/", protect, async (req, res) => {
       });
     }
 
-    // Keep this flag false until Paybeta authentication and
-    // the sandbox purchase workflow have been verified.
     if (process.env.PAYBETA_PURCHASES_ENABLED !== "true") {
       return res.status(503).json({
         success: false,
@@ -322,23 +265,25 @@ router.post("/", protect, async (req, res) => {
 
     const mode = process.env.PAYBETA_MODE;
     const baseUrl = BASE_URLS[mode];
+
     const configuredUrl = (
       process.env.PAYBETA_BASE_URL || ""
     ).replace(/\/+$/, "");
 
+    const apiKey = process.env.PAYBETA_API_KEY;
     const secret = process.env.PAYBETA_SECRET_KEY;
 
-    if (!baseUrl || configuredUrl !== baseUrl || !secret) {
+    if (!baseUrl || configuredUrl !== baseUrl || !apiKey || !secret) {
       return res.status(503).json({
         success: false,
         message: "Paybeta is not configured correctly.",
       });
     }
 
-    // Never accept the price supplied by the browser.
+    // Always obtain the price from Paybeta.
     const packages = await getPaybetaPlans(
       baseUrl,
-      secret,
+      apiKey,
       NETWORKS[network]
     );
 
@@ -355,8 +300,7 @@ router.post("/", protect, async (req, res) => {
       });
     }
 
-    // Reserve funds and record the order atomically.
-    // MongoDB must support transactions (Atlas does).
+    // Reserve wallet funds and create the pending order atomically.
     const session = await mongoose.startSession();
 
     try {
@@ -407,8 +351,7 @@ router.post("/", protect, async (req, res) => {
       await session.endSession();
     }
 
-    // The provider call happens AFTER the wallet reservation commits.
-    // Never automatically repeat this request after an uncertain result.
+    // Submit the purchase only once.
     let response;
     let result;
 
@@ -420,7 +363,7 @@ router.post("/", protect, async (req, res) => {
           headers: {
             Accept: "application/json",
             "Content-Type": "application/json",
-            "P-API-KEY": secret,
+            "P-API-KEY": apiKey,
           },
           body: JSON.stringify({
             service: NETWORKS[network],
@@ -441,8 +384,8 @@ router.post("/", protect, async (req, res) => {
         result = null;
       }
     } catch (error) {
-      // A timeout or connection failure is ambiguous: Paybeta
-      // might have processed the request. Keep funds reserved.
+      // The provider may have received the request.
+      // Never automatically submit it again or refund yet.
       console.error("Paybeta purchase outcome is uncertain:", {
         reference,
         error: error.message,
@@ -455,24 +398,142 @@ router.post("/", protect, async (req, res) => {
       });
     }
 
-    const providerStatus = result?.status;
+    // Record the initial provider response, but do not treat
+    // purchase acceptance as proof of successful delivery.
+    await Transaction.updateOne(
+      { reference, status: "pending" },
+      {
+        $set: {
+          "metadata.providerPurchaseStatus": result?.status || null,
+          "metadata.providerPurchaseMessage": result?.message || null,
+          "metadata.providerPurchaseHttpStatus": response.status,
+        },
+      }
+    );
 
-    if (providerStatus === "successful") {
-      await Transaction.updateOne(
-        { reference, status: "pending" },
+    // Query Paybeta for the actual transaction outcome.
+    let queryResponse;
+    let queryResult;
+
+    try {
+      queryResponse = await fetch(
+        `${baseUrl}/v2/transaction/query`,
         {
-          $set: {
-            status: "completed",
-            "metadata.providerReference": result?.data?.reference,
-            "metadata.providerTransactionId": result?.data?.transactionId,
-            "metadata.providerMessage": result?.message,
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "P-API-KEY": apiKey,
           },
+          body: JSON.stringify({ reference }),
+          signal: AbortSignal.timeout(10000),
         }
       );
 
+      const queryRaw = await queryResponse.text();
+
+      try {
+        queryResult = JSON.parse(queryRaw);
+      } catch {
+        queryResult = null;
+      }
+    } catch (error) {
+      console.error("Paybeta transaction query failed:", {
+        reference,
+        error: error.message,
+      });
+
+      return res.status(202).json({
+        success: true,
+        message: "Your order is awaiting provider confirmation.",
+        order: { reference, status: "pending", amount },
+      });
+    }
+
+    if (!queryResponse.ok || !queryResult) {
+      return res.status(202).json({
+        success: true,
+        message: "Your order is awaiting provider confirmation.",
+        order: { reference, status: "pending", amount },
+      });
+    }
+
+    // Refund only a provider-confirmed final failure.
+    if (String(queryResult.code) === "02") {
+      const transaction = await Transaction.findOne({
+        reference,
+        type: "data_purchase",
+      });
+
+      if (!transaction) {
+        throw new Error("Purchase transaction not found during refund.");
+      }
+
+      const refundResult = await refundConfirmedFailure(
+        transaction._id,
+        reference
+      );
+
+      if (!refundResult.refunded) {
+        return res.status(503).json({
+          success: false,
+          message: "The confirmed failure requires refund reconciliation.",
+          order: { reference, status: "pending", amount },
+        });
+      }
+
+      return res.status(502).json({
+        success: false,
+        message: "The provider confirmed failure. Your wallet has been refunded.",
+        order: { reference, status: "failed", amount },
+      });
+    }
+
+    const paymentStatus = String(
+      queryResult.data?.paymentStatus || ""
+    ).toLowerCase();
+
+    // Complete only after Paybeta confirms actual delivery.
+    if (
+      String(queryResult.code) === "00" &&
+      queryResult.status === "successful" &&
+      paymentStatus === "delivered"
+    ) {
+      const updated = await Transaction.findOneAndUpdate(
+        {
+          reference,
+          status: "pending",
+        },
+        {
+          $set: {
+            status: "completed",
+            "metadata.providerStatus": queryResult.status,
+            "metadata.paymentStatus": queryResult.data.paymentStatus,
+            "metadata.providerTransactionId":
+              queryResult.data.transactionId || null,
+            "metadata.deliveryConfirmedAt": new Date(),
+          },
+        },
+        { new: true }
+      );
+
+      if (!updated) {
+        const current = await Transaction.findOne({ reference });
+
+        return res.status(200).json({
+          success: true,
+          message: "Your order has already been reconciled.",
+          order: {
+            reference,
+            status: current?.status || "pending",
+            amount,
+          },
+        });
+      }
+
       return res.status(200).json({
         success: true,
-        message: "Data purchase successful.",
+        message: "Data delivery confirmed successfully.",
         order: {
           reference,
           status: "completed",
@@ -484,28 +545,17 @@ router.post("/", protect, async (req, res) => {
       });
     }
 
-    if (providerStatus === "failed") {
-      const transaction = await Transaction.findOne({ reference });
-
-      if (transaction) {
-        await refundConfirmedFailure(transaction._id, reference);
-      }
-
-      return res.status(502).json({
-        success: false,
-        message: "The provider reported a failed purchase. Check your order status before trying again.",
-        order: { reference, status: "failed" },
-      });
-    }
-
-    // Pending, unknown status, or an unexpected HTTP response:
-    // retain the pending order and funds until reconciliation.
+    // Pending, not found, or unknown results remain unresolved.
+    // The wallet reservation is retained.
     await Transaction.updateOne(
       { reference, status: "pending" },
       {
         $set: {
+          "metadata.providerQueryCode": queryResult.code || null,
           "metadata.providerMessage":
-            result?.message || `Unexpected HTTP ${response.status}`,
+            queryResult.message ||
+            result?.message ||
+            "Awaiting delivery confirmation.",
         },
       }
     );
@@ -516,9 +566,7 @@ router.post("/", protect, async (req, res) => {
       order: { reference, status: "pending", amount },
     });
   } catch (error) {
-    
-    // A concurrent request may have created this order first.
-    // Return that order instead of treating the retry as a server error.
+    // Handle a concurrent duplicate order safely.
     if (error?.code === 11000 && reference) {
       try {
         const existing = await Transaction.findOne({
@@ -566,5 +614,6 @@ router.post("/", protect, async (req, res) => {
     });
   }
 });
+
 
 module.exports = router;

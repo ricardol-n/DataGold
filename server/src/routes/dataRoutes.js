@@ -36,7 +36,7 @@ router.get("/plans", protect, async (req, res) => {
   if (
     !expectedBaseUrl ||
     baseUrl !== expectedBaseUrl ||
-    !process.env.PAYBETA_SECRET_KEY
+    !process.env.PAYBETA_API_KEY
   ) {
     return res.status(503).json({
       success: false,
@@ -53,7 +53,7 @@ router.get("/plans", protect, async (req, res) => {
     method: "GET",
     headers: {
         Accept: "application/json",
-        "P-API-KEY": process.env.PAYBETA_SECRET_KEY,
+        "P-API-KEY": process.env.PAYBETA_API_KEY,
     },
     signal: AbortSignal.timeout(15000),
     });
